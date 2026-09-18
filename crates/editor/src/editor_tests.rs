@@ -3866,6 +3866,122 @@ async fn test_autoscroll_auto_height_has_no_margin(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_smooth_scroll_lags_behind_a_jump(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    update_test_editor_settings(cx, &|settings| {
+        let smooth_scroll = settings.smooth_scroll.get_or_insert_default();
+        smooth_scroll.enabled = Some(true);
+        // Long enough that the animation is still in flight when we look at it.
+        smooth_scroll.duration = Some(10_000.into());
+        // High enough that the whole jump stays below the skip-ahead threshold.
+        smooth_scroll.max_distance = Some(100.);
+    });
+    let mut cx = EditorTestContext::new(cx).await;
+    set_up_tall_editor(&mut cx);
+
+    // Nothing has jumped yet, so the viewport is drawn where it actually is.
+    assert_eq!(
+        cx.update_editor(|editor, _, _| editor.take_smooth_scroll_offset()),
+        0.
+    );
+
+    jump_to_display_row_150(&mut cx);
+
+    // The scroll anchor has already moved to the destination...
+    let scroll_top =
+        cx.update_editor(|editor, window, cx| editor.snapshot(window, cx).scroll_position().y);
+    assert!(
+        scroll_top > 100.,
+        "the jump should have taken effect on the scroll anchor, which is at {scroll_top}"
+    );
+
+    // ...while the viewport is still drawn back where it came from.
+    let offset = cx.update_editor(|editor, _, _| editor.take_smooth_scroll_offset());
+    assert!(
+        offset > 1.,
+        "the viewport should trail the jump it is animating, but it is only {offset} rows behind"
+    );
+}
+
+#[gpui::test]
+async fn test_smooth_scroll_skips_ahead_on_very_long_jumps(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    update_test_editor_settings(cx, &|settings| {
+        let smooth_scroll = settings.smooth_scroll.get_or_insert_default();
+        smooth_scroll.enabled = Some(true);
+        smooth_scroll.duration = Some(10_000.into());
+        // One screen, which is the ten visible lines set up below.
+        smooth_scroll.max_distance = Some(1.);
+    });
+    let mut cx = EditorTestContext::new(cx).await;
+    set_up_tall_editor(&mut cx);
+    jump_to_display_row_150(&mut cx);
+
+    // The jump spans well over a hundred rows, but we only animate the last screen of it.
+    let offset = cx.update_editor(|editor, _, _| editor.take_smooth_scroll_offset());
+    assert!(
+        offset > 1. && offset <= 10.,
+        "a jump across the file should animate at most one screen, but it trails {offset} rows behind"
+    );
+}
+
+#[gpui::test]
+async fn test_smooth_scroll_is_off_by_default(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    let mut cx = EditorTestContext::new(cx).await;
+    set_up_tall_editor(&mut cx);
+    jump_to_display_row_150(&mut cx);
+
+    assert_eq!(
+        cx.update_editor(|editor, _, _| editor.take_smooth_scroll_offset()),
+        0.
+    );
+}
+
+/// Opens a two hundred line buffer in a ten line viewport, scrolled to the top.
+#[track_caller]
+fn set_up_tall_editor(cx: &mut EditorTestContext) {
+    let line_height = cx.update_editor(|editor, window, cx| {
+        editor
+            .style(cx)
+            .text
+            .line_height_in_pixels(window.rem_size())
+    });
+    let window = cx.window;
+    cx.simulate_window_resize(window, size(px(1000.), 10. * line_height));
+
+    let text = (0..200)
+        .map(|row| format!("line {row}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    cx.set_state(&format!("ˇ{text}"));
+    cx.update(|window, cx| {
+        window.refresh();
+        let _ = window.draw(cx);
+    });
+}
+
+#[track_caller]
+fn jump_to_display_row_150(cx: &mut EditorTestContext) {
+    cx.update_editor(|editor, window, cx| {
+        editor.change_selections(
+            SelectionEffects::scroll(Autoscroll::center()),
+            window,
+            cx,
+            |s| {
+                s.select_display_ranges([
+                    DisplayPoint::new(DisplayRow(150), 0)..DisplayPoint::new(DisplayRow(150), 0)
+                ]);
+            },
+        );
+    });
+    cx.update(|window, cx| {
+        window.refresh();
+        let _ = window.draw(cx);
+    });
+}
+
+#[gpui::test]
 async fn test_cursor_animation_remains_active_during_keyboard_autoscroll(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
     update_test_editor_settings(cx, &|settings| {

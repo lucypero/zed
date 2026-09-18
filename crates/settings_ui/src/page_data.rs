@@ -1942,7 +1942,7 @@ fn editor_page() -> SettingsPage {
         ]
     }
 
-    fn scrolling_section() -> [SettingsPageItem; 9] {
+    fn scrolling_section() -> [SettingsPageItem; 12] {
         [
             SettingsPageItem::SectionHeader("Scrolling"),
             SettingsPageItem::SettingItem(SettingItem {
@@ -2070,6 +2070,81 @@ fn editor_page() -> SettingsPage {
                             .sticky_scroll
                             .get_or_insert_default()
                             .enabled = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Smooth Scroll",
+                description: "Whether the viewport animates towards its new position when the editor jumps, instead of snapping to it.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("smooth_scroll.enabled"),
+                    pick: |settings_content| {
+                        settings_content
+                            .editor
+                            .smooth_scroll
+                            .as_ref()?
+                            .enabled
+                            .as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .editor
+                            .smooth_scroll
+                            .get_or_insert_default()
+                            .enabled = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Smooth Scroll Duration",
+                description: "How long the smooth scroll animation takes to settle on the new scroll position.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("smooth_scroll.duration"),
+                    pick: |settings_content| {
+                        settings_content
+                            .editor
+                            .smooth_scroll
+                            .as_ref()?
+                            .duration
+                            .as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .editor
+                            .smooth_scroll
+                            .get_or_insert_default()
+                            .duration = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Smooth Scroll Max Distance",
+                description: "The longest jump that is animated in full, measured in screens. Longer jumps skip ahead and animate only the remainder.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("smooth_scroll.max_distance"),
+                    pick: |settings_content| {
+                        settings_content
+                            .editor
+                            .smooth_scroll
+                            .as_ref()?
+                            .max_distance
+                            .as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .editor
+                            .smooth_scroll
+                            .get_or_insert_default()
+                            .max_distance = value;
                     },
                 }),
                 metadata: None,

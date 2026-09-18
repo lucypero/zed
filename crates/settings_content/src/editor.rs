@@ -24,6 +24,10 @@ pub struct EditorSettingsContent {
     pub cursor_shape: Option<CursorShape>,
     /// Cursor movement animation settings.
     pub cursor_animation: Option<CursorAnimationSettingsContent>,
+    /// Smooth scrolling settings, applied when the editor jumps to a new
+    /// scroll position (`ctrl-d`, page up/down, go to definition, search
+    /// results, and any other motion that moves the viewport).
+    pub smooth_scroll: Option<SmoothScrollSettingsContent>,
     /// Determines how snippets are sorted relative to other completion items.
     ///
     /// Default: inline
@@ -373,6 +377,28 @@ pub struct CursorAnimationSettingsContent {
     ///
     /// Default: false
     pub enabled: Option<bool>,
+}
+
+#[with_fallible_options]
+#[derive(Clone, Default, Debug, Serialize, Deserialize, JsonSchema, MergeFrom, PartialEq)]
+pub struct SmoothScrollSettingsContent {
+    /// Whether the viewport animates towards its new position when the editor
+    /// jumps, instead of snapping to it.
+    ///
+    /// Default: false
+    pub enabled: Option<bool>,
+    /// How long the animation takes to settle on the new scroll position.
+    ///
+    /// Default: 120
+    pub duration: Option<DelayMs>,
+    /// The longest jump that is animated in full, measured in screens. Jumps
+    /// beyond this distance skip ahead to within this many screens of the
+    /// destination and animate the remainder, so that jumping across a large
+    /// file doesn't blur through thousands of lines.
+    ///
+    /// Default: 1.0
+    #[serde(serialize_with = "crate::serialize_optional_f32_with_two_decimal_places")]
+    pub max_distance: Option<f32>,
 }
 
 // Toolbar related settings

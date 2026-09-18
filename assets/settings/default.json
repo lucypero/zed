@@ -301,6 +301,22 @@
     // Whether cursor movement animation is enabled.
     "enabled": false,
   },
+  // Smooth scrolling settings. When enabled, jumping to a new scroll position
+  // (ctrl-d, page up/down, go to definition, search results, and any other
+  // motion that moves the viewport) animates instead of snapping.
+  // Enabling this may cause additional editor redraws and increase rendering overhead.
+  "smooth_scroll": {
+    // Whether the viewport animates towards its new position when the editor jumps.
+    "enabled": false,
+    // How long, in milliseconds, the animation takes to settle on the new
+    // scroll position.
+    "duration": 120,
+    // The longest jump that is animated in full, measured in screens. Jumps
+    // beyond this distance skip ahead to within this many screens of the
+    // destination and animate the remainder, so that jumping across a large
+    // file doesn't blur through thousands of lines.
+    "max_distance": 1.0,
+  },
   // Determines when the mouse cursor should be hidden in response to keyboard
   // input.
   //

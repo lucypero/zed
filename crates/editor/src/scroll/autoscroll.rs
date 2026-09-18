@@ -233,6 +233,9 @@ impl Editor {
         let visible_sticky_headers =
             self.visible_sticky_header_count_for_point(&display_map, target_point, cx);
 
+        // Moving the viewport to follow the cursor is a jump: `G`, `gg`, search
+        // results, go to definition, and so on all land here.
+        self.scroll_manager.animate_next_scroll();
         let was_autoscrolled = match strategy {
             AutoscrollStrategy::Fit | AutoscrollStrategy::Newest => {
                 let (margin_top, margin_bottom) = self.fit_autoscroll_margins(
@@ -287,6 +290,8 @@ impl Editor {
                 self.set_scroll_position_internal(scroll_position, local, true, window, cx)
             }
         };
+
+        self.scroll_manager.cancel_animate_next_scroll();
 
         self.scroll_manager.last_autoscroll = Some((
             self.scroll_manager.offset(cx),

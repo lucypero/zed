@@ -8755,6 +8755,19 @@ impl Element for EditorElement {
                     });
 
                     let mut scroll_position = snapshot.scroll_position();
+                    // While a jump animates, draw the viewport short of where
+                    // the editor has actually scrolled to, and keep asking for
+                    // frames until it has caught up.
+                    if !is_minimap {
+                        let smooth_scroll_offset = self
+                            .editor
+                            .update(cx, |editor, _| editor.take_smooth_scroll_offset());
+                        if smooth_scroll_offset != 0. {
+                            scroll_position.y = (scroll_position.y - smooth_scroll_offset)
+                                .clamp(0., max_scroll_top);
+                            window.request_animation_frame();
+                        }
+                    }
                     if !line_height.is_zero() {
                         scroll_position.y = window
                             .pixel_snap_f64(scroll_position.y * f64::from(line_height))
