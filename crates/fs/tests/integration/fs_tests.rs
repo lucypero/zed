@@ -736,19 +736,8 @@ async fn test_realfs_executable_metadata(executor: BackgroundExecutor) {
     let fs = RealFs::new(None, executor);
     gpui::block_on(fs.create_symlink(&symlink_path, PathBuf::from("executable.sh"))).unwrap();
 
-    let non_executable_metadata = fs
-        .metadata(&non_executable_path)
-        .await
-        .expect("metadata call succeeds")
-        .expect("metadata returned");
-    assert!(!non_executable_metadata.is_executable);
-
-    let executable_metadata = fs
-        .metadata(&executable_path)
-        .await
-        .expect("metadata call succeeds")
-        .expect("metadata returned");
-    assert!(executable_metadata.is_executable);
+    assert!(!fs.is_executable(&non_executable_path).await);
+    assert!(fs.is_executable(&executable_path).await);
 
     let symlink_metadata = fs
         .metadata(&symlink_path)
@@ -756,7 +745,8 @@ async fn test_realfs_executable_metadata(executor: BackgroundExecutor) {
         .expect("metadata call succeeds")
         .expect("metadata returned");
     assert!(symlink_metadata.is_symlink);
-    assert!(symlink_metadata.is_executable);
+    assert!(fs.is_executable(&symlink_path).await);
+    assert!(!fs.is_executable(&path.join("missing.sh")).await);
 }
 
 #[gpui::test]
@@ -775,7 +765,7 @@ async fn test_realfs_broken_symlink_metadata(executor: BackgroundExecutor) {
     assert!(metadata.is_symlink);
     assert!(!metadata.is_dir);
     assert!(!metadata.is_fifo);
-    assert!(!metadata.is_executable);
+    assert!(!fs.is_executable(&symlink_path).await);
     // don't care about len or mtime on symlinks?
 }
 
@@ -795,7 +785,7 @@ async fn test_realfs_symlink_loop_metadata(executor: BackgroundExecutor) {
     assert!(metadata.is_symlink);
     assert!(!metadata.is_dir);
     assert!(!metadata.is_fifo);
-    assert!(!metadata.is_executable);
+    assert!(!fs.is_executable(&symlink_path).await);
     // don't care about len or mtime on symlinks?
 }
 
@@ -1374,4 +1364,84 @@ async fn restore_can_be_retried_after_collision(cx: &mut TestAppContext) {
         fs.restore(trash_id).await.unwrap_err(),
         TrashRestoreError::AlreadyRestored
     ));
+}
+
+/// `read_dir_with_metadata` must list every child, and any metadata it reports
+/// must match what `metadata` returns for that child. On Windows, plain files on
+/// NTFS come back with their metadata so the scanner can skip opening them.
+#[gpui::test]
+async fn test_read_dir_with_metadata_matches_metadata(executor: BackgroundExecutor) {
+    executor.allow_parking();
+
+    let tempdir = TempDir::new().unwrap();
+    let root = tempdir.path();
+    let fs = RealFs::new(None, executor);
+
+    std::fs::create_dir(root.join("subdir")).unwrap();
+    std::fs::write(root.join("subdir").join("nested.txt"), b"nested").unwrap();
+    std::fs::write(root.join("empty.txt"), b"").unwrap();
+    std::fs::write(root.join("small.txt"), b"hello").unwrap();
+    std::fs::write(root.join("larger.bin"), vec![7u8; 100_000]).unwrap();
+    std::fs::write(root.join("naïve_λ.txt"), b"unicode name").unwrap();
+    let read_only = root.join("readonly.txt");
+    std::fs::write(&read_only, b"locked down").unwrap();
+    let mut permissions = std::fs::metadata(&read_only).unwrap().permissions();
+    permissions.set_readonly(true);
+    std::fs::set_permissions(&read_only, permissions).unwrap();
+
+    let mut listed = fs.read_dir_with_metadata(root).await.unwrap();
+    listed.sort_by(|(a, _), (b, _)| a.cmp(b));
+    let listed_names = listed
+        .iter()
+        .map(|(path, _)| path.file_name().unwrap().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    let mut expected_names = vec![
+        "empty.txt",
+        "larger.bin",
+        "naïve_λ.txt",
+        "readonly.txt",
+        "small.txt",
+        "subdir",
+    ];
+    expected_names.sort();
+    assert_eq!(listed_names, expected_names);
+
+    let mut inodes = Vec::new();
+    for (path, listed_metadata) in &listed {
+        let expected = fs.metadata(path).await.unwrap().unwrap();
+        let Some(listed_metadata) = listed_metadata else {
+            // Only Windows lists metadata, and only for plain files.
+            assert!(
+                !cfg!(windows) || expected.is_dir,
+                "expected listed metadata for {path:?}"
+            );
+            continue;
+        };
+        assert!(cfg!(windows), "only Windows lists metadata");
+        assert!(!expected.is_dir, "directories are not listed with metadata");
+        assert_eq!(listed_metadata.inode, expected.inode, "inode of {path:?}");
+        assert_eq!(listed_metadata.mtime, expected.mtime, "mtime of {path:?}");
+        assert_eq!(listed_metadata.len, expected.len, "len of {path:?}");
+        assert_eq!(listed_metadata.is_dir, expected.is_dir, "is_dir of {path:?}");
+        assert_eq!(
+            listed_metadata.is_symlink, expected.is_symlink,
+            "is_symlink of {path:?}"
+        );
+        assert_eq!(
+            listed_metadata.is_writable, expected.is_writable,
+            "is_writable of {path:?}"
+        );
+        inodes.push(listed_metadata.inode);
+    }
+
+    let total = inodes.len();
+    inodes.sort_unstable();
+    inodes.dedup();
+    assert_eq!(inodes.len(), total, "file ids must be unique");
+
+    // Let the temp dir clean up the read-only file.
+    let mut permissions = std::fs::metadata(&read_only).unwrap().permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    permissions.set_readonly(false);
+    std::fs::set_permissions(&read_only, permissions).unwrap();
 }

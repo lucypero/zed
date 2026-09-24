@@ -140,11 +140,29 @@ pub trait Fs: Send + Sync {
     async fn is_file(&self, path: &Path) -> bool;
     async fn is_dir(&self, path: &Path) -> bool;
     async fn metadata(&self, path: &Path) -> Result<Option<Metadata>>;
+    /// Whether `path` (following a final symlink) is an executable file. Kept
+    /// separate from [`Metadata`] because on Windows answering it means
+    /// reading the file's header.
+    async fn is_executable(&self, path: &Path) -> bool;
     async fn read_link(&self, path: &Path) -> Result<PathBuf>;
     async fn read_dir(
         &self,
         path: &Path,
     ) -> Result<Pin<Box<dyn Send + Stream<Item = Result<PathBuf>>>>>;
+
+    /// Lists the children of `path`, each with its metadata when the platform
+    /// can report it as part of the listing. A child listed with `None` needs a
+    /// [`Fs::metadata`] call if the caller wants its metadata; unreadable
+    /// entries are logged and skipped.
+    ///
+    /// By default no metadata is reported, so callers that skip some children
+    /// never pay for statting them.
+    async fn read_dir_with_metadata(
+        &self,
+        path: &Path,
+    ) -> Result<Vec<(PathBuf, Option<Metadata>)>> {
+        read_dir_without_metadata(self, path).await
+    }
 
     /// Creates the native file watcher now rather than on the first `watch`, so a
     /// failure to start it (e.g. inotify instance limits) can be reported at startup.
@@ -320,7 +338,6 @@ pub struct Metadata {
     pub is_dir: bool,
     pub len: u64,
     pub is_fifo: bool,
-    pub is_executable: bool,
     pub is_writable: bool,
 }
 
@@ -730,6 +747,32 @@ fn read_dir_entries(path: PathBuf) -> Result<impl Send + Iterator<Item = Result<
     }))
 }
 
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(windows)]
+fn is_executable_file(path: &Path) -> bool {
+    path.is_executable()
+}
+
+async fn read_dir_without_metadata<F: Fs + ?Sized>(
+    fs: &F,
+    path: &Path,
+) -> Result<Vec<(PathBuf, Option<Metadata>)>> {
+    let mut children = fs.read_dir(path).await?;
+    let mut result = Vec::new();
+    while let Some(child) = children.next().await {
+        match child {
+            Ok(child) => result.push((child, None)),
+            Err(error) => log::error!("error processing entry {error:?}"),
+        }
+    }
+    Ok(result)
+}
+
 #[async_trait::async_trait]
 impl Fs for RealFs {
     async fn create_dir(&self, path: &Path) -> Result<()> {
@@ -1132,17 +1175,6 @@ impl Fs for RealFs {
         #[cfg(unix)]
         let is_fifo = metadata.file_type().is_fifo();
 
-        #[cfg(unix)]
-        let is_executable = metadata.is_file() && metadata.permissions().mode() & 0o111 != 0;
-
-        #[cfg(windows)]
-        let path_buf = path.to_path_buf();
-        #[cfg(windows)]
-        let is_executable = self
-            .executor
-            .spawn(async move { path_buf.is_executable() })
-            .await;
-
         Ok(Some(Metadata {
             inode,
             mtime: MTime(metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH)),
@@ -1150,9 +1182,36 @@ impl Fs for RealFs {
             is_symlink,
             is_dir: metadata.file_type().is_dir(),
             is_fifo,
-            is_executable,
             is_writable: !metadata.permissions().readonly(),
         }))
+    }
+
+    async fn is_executable(&self, path: &Path) -> bool {
+        let path = path.to_path_buf();
+        self.executor
+            .spawn(async move { is_executable_file(&path) })
+            .await
+    }
+
+    #[cfg(windows)]
+    async fn read_dir_with_metadata(
+        &self,
+        path: &Path,
+    ) -> Result<Vec<(PathBuf, Option<Metadata>)>> {
+        let dir = path.to_path_buf();
+        let listing = self
+            .executor
+            .spawn(async move { read_dir_with_metadata_windows(&dir) })
+            .await;
+        match listing {
+            Ok(entries) => Ok(entries),
+            Err(error) => {
+                // Some file systems (e.g. certain network shares) can't enumerate
+                // with file ids; list the plain way and let callers stat.
+                log::debug!("falling back to a plain directory listing for {path:?}: {error:#}");
+                read_dir_without_metadata(self, path).await
+            }
+        }
     }
 
     async fn read_link(&self, path: &Path) -> Result<PathBuf> {
@@ -3291,7 +3350,6 @@ impl Fs for FakeFs {
                     is_dir: false,
                     is_symlink,
                     is_fifo: false,
-                    is_executable: false,
                     is_writable: true,
                 },
                 FakeFsEntry::Dir {
@@ -3303,7 +3361,6 @@ impl Fs for FakeFs {
                     is_dir: true,
                     is_symlink,
                     is_fifo: false,
-                    is_executable: false,
                     is_writable: true,
                 },
                 FakeFsEntry::Symlink { .. } => unreachable!(),
@@ -3311,6 +3368,10 @@ impl Fs for FakeFs {
         } else {
             Ok(None)
         }
+    }
+
+    async fn is_executable(&self, _path: &Path) -> bool {
+        false
     }
 
     async fn read_link(&self, path: &Path) -> Result<PathBuf> {
@@ -3572,6 +3633,163 @@ fn read_recursive<'a>(
         Ok(())
     }
     .boxed()
+}
+
+/// Lists `dir` through `GetFileInformationByHandleEx(FileIdBothDirectoryInfo)`,
+/// which reports each child's attributes, size, mtime and file id in bulk, so
+/// scanning a directory doesn't open every file in it.
+///
+/// Plain files come back with their [`Metadata`]. Directories and reparse
+/// points come back with `None` for the caller to stat: NTFS updates a
+/// subdirectory's timestamps in its parent's index lazily, and a listing
+/// describes a link rather than its target.
+///
+/// Fails on volumes other than NTFS, whose listed file ids aren't guaranteed to
+/// match the ones [`file_id`] reads (ReFS ids are 128 bits wide).
+#[cfg(target_os = "windows")]
+fn read_dir_with_metadata_windows(dir: &Path) -> Result<Vec<(PathBuf, Option<Metadata>)>> {
+    use std::ffi::OsString;
+    use std::os::windows::{ffi::OsStringExt as _, fs::OpenOptionsExt as _, io::AsRawHandle as _};
+    use windows::Win32::{
+        Foundation::{ERROR_NO_MORE_FILES, HANDLE},
+        Storage::FileSystem::{
+            FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_REPARSE_POINT,
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_BOTH_DIR_INFO, FileIdBothDirectoryInfo,
+            GetFileInformationByHandleEx, GetVolumeInformationByHandleW,
+        },
+    };
+
+    /// 100ns intervals between 1601-01-01 and 1970-01-01.
+    const FILETIME_UNIX_EPOCH: i64 = 116_444_736_000_000_000;
+    const INVALID_FILE_ID: i64 = -1;
+
+    fn filetime_to_mtime(filetime: i64) -> MTime {
+        let since_unix_epoch = filetime - FILETIME_UNIX_EPOCH;
+        let intervals = since_unix_epoch.unsigned_abs();
+        let offset = Duration::new(intervals / 10_000_000, (intervals % 10_000_000) as u32 * 100);
+        let time = if since_unix_epoch >= 0 {
+            UNIX_EPOCH.checked_add(offset)
+        } else {
+            UNIX_EPOCH.checked_sub(offset)
+        };
+        MTime(time.unwrap_or(UNIX_EPOCH))
+    }
+
+    let directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0)
+        .open(dir)
+        .with_context(|| format!("failed to open directory {dir:?}"))?;
+    let handle = HANDLE(directory.as_raw_handle() as _);
+
+    let mut file_system_name = [0u16; 261];
+    // SAFETY: `handle` stays open while `directory` lives, and the name buffer
+    // is passed as a slice, so its length travels with it.
+    let volume_query = unsafe {
+        GetVolumeInformationByHandleW(
+            handle,
+            None,
+            None,
+            None,
+            None,
+            Some(&mut file_system_name[..]),
+        )
+    };
+    volume_query.with_context(|| format!("failed to query the volume of {dir:?}"))?;
+    let name_len = file_system_name
+        .iter()
+        .position(|&c| c == 0)
+        .unwrap_or(file_system_name.len());
+    let file_system_name = String::from_utf16_lossy(&file_system_name[..name_len]);
+    anyhow::ensure!(
+        file_system_name == "NTFS",
+        "{dir:?} is on a {file_system_name} volume"
+    );
+
+    // `u64` elements keep the buffer 8-byte aligned, which the records need.
+    let mut buffer = vec![0u64; 64 * 1024 / size_of::<u64>()];
+    let buffer_bytes = buffer.len() * size_of::<u64>();
+    let name_offset = std::mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileName);
+    let mut entries = Vec::new();
+
+    loop {
+        // SAFETY: the buffer is writable and 8-byte aligned, its length in bytes
+        // is passed alongside it, and `handle` stays open while `directory` lives.
+        let result = unsafe {
+            GetFileInformationByHandleEx(
+                handle,
+                FileIdBothDirectoryInfo,
+                buffer.as_mut_ptr().cast(),
+                buffer_bytes as u32,
+            )
+        };
+        if let Err(error) = result {
+            if error.code() == ERROR_NO_MORE_FILES.to_hresult() {
+                break;
+            }
+            return Err(anyhow::Error::new(error))
+                .with_context(|| format!("failed to enumerate directory {dir:?}"));
+        }
+
+        // SAFETY: `u8` has no alignment requirement and every bit pattern is a
+        // valid `u8`, so the `u64` buffer can be viewed as its bytes.
+        let bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(buffer.as_ptr().cast(), buffer_bytes) };
+        let mut offset = 0;
+        loop {
+            // Each record is a `FILE_ID_BOTH_DIR_INFO` followed by its name. The
+            // fields are read from bytes because the last record can be shorter
+            // than `size_of::<FILE_ID_BOTH_DIR_INFO>()`.
+            let Some(record) = bytes.get(offset..).filter(|r| r.len() >= name_offset) else {
+                anyhow::bail!("malformed listing of {dir:?}");
+            };
+            let read_u32 = |at: usize| u32::from_le_bytes(record[at..at + 4].try_into().unwrap());
+            let read_i64 = |at: usize| i64::from_le_bytes(record[at..at + 8].try_into().unwrap());
+
+            let next_entry_offset =
+                read_u32(std::mem::offset_of!(FILE_ID_BOTH_DIR_INFO, NextEntryOffset)) as usize;
+            let attributes = read_u32(std::mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileAttributes));
+            let name_bytes =
+                read_u32(std::mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileNameLength)) as usize;
+            let file_id = read_i64(std::mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileId));
+            let last_write_time =
+                read_i64(std::mem::offset_of!(FILE_ID_BOTH_DIR_INFO, LastWriteTime));
+            let end_of_file = read_i64(std::mem::offset_of!(FILE_ID_BOTH_DIR_INFO, EndOfFile));
+
+            let Some(name) = record.get(name_offset..name_offset + name_bytes) else {
+                anyhow::bail!("malformed listing of {dir:?}");
+            };
+            let name = name
+                .chunks_exact(2)
+                .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                .collect::<Vec<u16>>();
+            let name = OsString::from_wide(&name);
+
+            if name != "." && name != ".." {
+                let is_plain_file = attributes
+                    & (FILE_ATTRIBUTE_DIRECTORY.0 | FILE_ATTRIBUTE_REPARSE_POINT.0)
+                    == 0;
+                let metadata = (is_plain_file && file_id != 0 && file_id != INVALID_FILE_ID)
+                    .then(|| Metadata {
+                        inode: file_id as u64,
+                        mtime: filetime_to_mtime(last_write_time),
+                        len: end_of_file as u64,
+                        is_symlink: false,
+                        is_dir: false,
+                        is_fifo: false,
+                        is_writable: attributes & FILE_ATTRIBUTE_READONLY.0 == 0,
+                    });
+                entries.push((dir.join(name), metadata));
+            }
+
+            if next_entry_offset == 0 {
+                break;
+            }
+            offset += next_entry_offset;
+        }
+    }
+
+    Ok(entries)
 }
 
 // todo(windows)

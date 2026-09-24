@@ -8908,11 +8908,7 @@ impl Repository {
                         environment,
                         ..
                     }) => {
-                        let executable = match fs.metadata(&abs_path).await {
-                            Ok(Some(meta)) => meta.is_executable,
-                            Ok(None) => false,
-                            Err(_err) => false,
-                        };
+                        let executable = fs.is_executable(&abs_path).await;
                         let content =
                             content.map(|content| encode_text(content, encoding, has_bom));
                         backend
